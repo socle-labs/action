@@ -31,6 +31,10 @@ inputs:
     description: "IaC tool to use: opentofu or terraform"
     required: false
     default: "opentofu"
+  destroy:
+    description: "Run in destroy mode"
+    required: false
+    default: "false"
   runner-type:
     description: "Runner type: github-hosted or socle-private"
     required: false
@@ -66,6 +70,12 @@ runs:
           echo "bin=tofu" >> $GITHUB_OUTPUT
         fi
 
+        if [ "${{ inputs.destroy }}" == "true" ]; then
+          echo "destroy_flag=-destroy" >> $GITHUB_OUTPUT
+        else
+          echo "destroy_flag=" >> $GITHUB_OUTPUT
+        fi
+
     - name: Init
       shell: bash
       working-directory: ${{ inputs.tf-path }}
@@ -78,7 +88,7 @@ runs:
       working-directory: ${{ inputs.tf-path }}
       run: |
         set +e
-        ${{ steps.cli.outputs.bin }} plan -out=tfplan -no-color -detailed-exitcode 2>&1 | tee plan_output.txt
+        ${{ steps.cli.outputs.bin }} plan -out=tfplan -no-color -detailed-exitcode ${{ steps.cli.outputs.destroy_flag }} 2>&1 | tee plan_output.txt
         PLAN_EXIT=$?
         set -e
 
@@ -97,7 +107,7 @@ runs:
       working-directory: ${{ inputs.tf-path }}
       run: |
         set +e
-        ${{ steps.cli.outputs.bin }} apply -auto-approve -no-color 2>&1 | tee apply_output.txt
+        ${{ steps.cli.outputs.bin }} apply -auto-approve -no-color ${{ steps.cli.outputs.destroy_flag }} 2>&1 | tee apply_output.txt
         APPLY_EXIT=$?
         set -e
 
