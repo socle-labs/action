@@ -1,0 +1,142 @@
+name: "Socle Infrastructure Run"
+description: "Run OpenTofu/Terraform plan/apply and report results back to Socle"
+branding:
+  icon: "layers"
+  color: "green"
+
+inputs:
+  api-url:
+    description: "Socle API URL"
+    required: false
+    default: "https://api.socle.sh"
+  api-key:
+    description: "Socle API key for authentication"
+    required: true
+  run-id:
+    description: "Socle run ID (provided by workflow dispatch)"
+    required: true
+  command:
+    description: "Command to execute (plan or apply)"
+    required: true
+    default: "plan"
+  tf-path:
+    description: "Path to configuration directory"
+    required: false
+    default: "."
+  tf-version:
+    description: "OpenTofu/Terraform version to use"
+    required: false
+    default: "latest"
+  tool:
+    description: "IaC tool to use: opentofu or terraform"
+    required: false
+    default: "opentofu"
+  runner-type:
+    description: "Runner type: github-hosted or socle-private"
+    required: false
+    default: "github-hosted"
+
+runs:
+  using: "composite"
+  steps:
+    # OpenTofu setup
+    - name: Setup OpenTofu
+      if: inputs.tool == 'opentofu'
+      uses: opentofu/setup-opentofu@v1
+      with:
+        tofu_version: ${{ inputs.tf-version }}
+        tofu_wrapper: false
+
+    # Terraform setup (fallback)
+    - name: Setup Terraform
+      if: inputs.tool == 'terraform'
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.tf-version }}
+        terraform_wrapper: false
+
+    # Set the CLI binary name based on tool choice
+    - name: Set CLI binary
+      id: cli
+      shell: bash
+      run: |
+        if [ "${{ inputs.tool }}" == "terraform" ]; then
+          echo "bin=terraform" >> $GITHUB_OUTPUT
+        else
+          echo "bin=tofu" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Init
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: ${{ steps.cli.outputs.bin }} init -no-color
+
+    - name: Plan
+      if: inputs.command == 'plan'
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        set +e
+        ${{ steps.cli.outputs.bin }} plan -out=tfplan -no-color -detailed-exitcode 2>&1 | tee plan_output.txt
+        PLAN_EXIT=$?
+        set -e
+
+        if [ $PLAN_EXIT -eq 1 ]; then
+          echo "plan_failed=true" >> $GITHUB_OUTPUT
+          echo "error_message=$(cat plan_output.txt | tail -20)" >> $GITHUB_OUTPUT
+        else
+          ${{ steps.cli.outputs.bin }} show -json tfplan > plan.json
+          echo "plan_failed=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Apply
+      if: inputs.command == 'apply'
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        set +e
+        ${{ steps.cli.outputs.bin }} apply -auto-approve -no-color 2>&1 | tee apply_output.txt
+        APPLY_EXIT=$?
+        set -e
+
+        if [ $APPLY_EXIT -ne 0 ]; then
+          echo "apply_failed=true" >> $GITHUB_OUTPUT
+        else
+          echo "apply_failed=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Report Plan Result
+      if: inputs.command == 'plan'
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        if [ "${{ steps.plan.outputs.plan_failed }}" == "true" ]; then
+          curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"failed\", \"errorMessage\": $(cat plan_output.txt | jq -Rs .)}"
+        else
+          curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"planned\", \"planJson\": $(cat plan.json)}"
+        fi
+
+    - name: Report Apply Result
+      if: inputs.command == 'apply'
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        if [ "${{ steps.apply.outputs.apply_failed }}" == "true" ]; then
+          curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"failed\", \"errorMessage\": $(cat apply_output.txt | jq -Rs .)}"
+        else
+          curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"applied\", \"applyLog\": $(cat apply_output.txt | jq -Rs .)}"
+        fi
