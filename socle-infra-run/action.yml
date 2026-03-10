@@ -1,0 +1,343 @@
+name: "Socle Infrastructure Run"
+description: "Run OpenTofu/Terraform plan/apply and report results back to Socle"
+branding:
+  icon: "layers"
+  color: "green"
+
+inputs:
+  api-url:
+    description: "Socle API URL"
+    required: false
+    default: "https://api.socle.cloud"
+  api-key:
+    description: "Socle API key for authentication"
+    required: true
+  run-id:
+    description: "Socle run ID (provided by workflow dispatch)"
+    required: true
+  command:
+    description: "Command to execute (plan or apply)"
+    required: true
+    default: "plan"
+  tf-path:
+    description: "Path to configuration directory"
+    required: false
+    default: "."
+  tf-version:
+    description: "OpenTofu/Terraform version to use"
+    required: false
+    default: "latest"
+  tool:
+    description: "IaC tool to use: opentofu or terraform"
+    required: false
+    default: "opentofu"
+  destroy:
+    description: "Run in destroy mode"
+    required: false
+    default: "false"
+  runner-type:
+    description: "Runner type: github-hosted or socle-private"
+    required: false
+    default: "github-hosted"
+  checkov:
+    description: "Run Checkov security scan (true/false)"
+    required: false
+    default: "false"
+  tfsec:
+    description: "Run tfsec security scan via Trivy (true/false)"
+    required: false
+    default: "false"
+  terraform-test:
+    description: "Run terraform/tofu test (true/false)"
+    required: false
+    default: "false"
+
+outputs:
+  security-scan-status:
+    description: "Security scan result: passed, failed, or skipped"
+    value: ${{ steps.scan-summary.outputs.scan_status }}
+  security-scan-findings:
+    description: "Number of security scan findings"
+    value: ${{ steps.scan-summary.outputs.finding_count }}
+
+runs:
+  using: "composite"
+  steps:
+    # OpenTofu setup
+    - name: Setup OpenTofu
+      if: inputs.tool == 'opentofu'
+      uses: opentofu/setup-opentofu@v1
+      with:
+        tofu_version: ${{ inputs.tf-version }}
+        tofu_wrapper: false
+
+    # Terraform setup (fallback)
+    - name: Setup Terraform
+      if: inputs.tool == 'terraform'
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.tf-version }}
+        terraform_wrapper: false
+
+    # Set the CLI binary name based on tool choice
+    - name: Set CLI binary
+      id: cli
+      shell: bash
+      run: |
+        if [ "${{ inputs.tool }}" == "terraform" ]; then
+          echo "bin=terraform" >> $GITHUB_OUTPUT
+        else
+          echo "bin=tofu" >> $GITHUB_OUTPUT
+        fi
+
+        if [ "${{ inputs.destroy }}" == "true" ]; then
+          echo "destroy_flag=-destroy" >> $GITHUB_OUTPUT
+        else
+          echo "destroy_flag=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Init
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: ${{ steps.cli.outputs.bin }} init -no-color
+
+    - name: Validate
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: ${{ steps.cli.outputs.bin }} validate -no-color
+
+    - name: Checkov Scan
+      if: inputs.checkov == 'true' && inputs.command == 'plan'
+      id: checkov
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        pip install -q checkov 2>/dev/null
+        set +e
+        checkov -d . --output json --quiet > checkov_results.json 2>&1
+        CHECKOV_EXIT=$?
+        set -e
+        echo "exit_code=$CHECKOV_EXIT" >> $GITHUB_OUTPUT
+
+        PASSED=$(jq -r '[.[] | .summary.passed] | add // 0' checkov_results.json 2>/dev/null || echo 0)
+        FAILED=$(jq -r '[.[] | .summary.failed] | add // 0' checkov_results.json 2>/dev/null || echo 0)
+        echo "::notice::Checkov: $PASSED passed, $FAILED failed"
+
+    - name: tfsec Scan
+      if: inputs.tfsec == 'true' && inputs.command == 'plan'
+      id: tfsec
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        TRIVY_VERSION=$(curl -s https://api.github.com/repos/aquasecurity/trivy/releases/latest | jq -r .tag_name)
+        curl -sfL "https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz" | tar xz -C /usr/local/bin trivy
+        set +e
+        trivy config --format json --output tfsec_results.json . 2>&1
+        TFSEC_EXIT=$?
+        set -e
+        echo "exit_code=$TFSEC_EXIT" >> $GITHUB_OUTPUT
+
+        RESULTS=$(jq -r '.Results // [] | length' tfsec_results.json 2>/dev/null || echo 0)
+        echo "::notice::tfsec (Trivy): $RESULTS file(s) scanned"
+
+    - name: Terraform Test
+      if: inputs.terraform-test == 'true' && inputs.command == 'plan'
+      id: tftest
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        set +e
+        ${{ steps.cli.outputs.bin }} test -no-color 2>&1 | tee test_output.txt
+        TEST_EXIT=$?
+        set -e
+        echo "exit_code=$TEST_EXIT" >> $GITHUB_OUTPUT
+
+    - name: Report Scan Results
+      if: inputs.command == 'plan' && (inputs.checkov == 'true' || inputs.tfsec == 'true' || inputs.terraform-test == 'true')
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        SCAN_STATUS="passed"
+        SCAN_DETAILS=""
+
+        if [ "${{ inputs.checkov }}" == "true" ] && [ "${{ steps.checkov.outputs.exit_code }}" != "0" ]; then
+          SCAN_STATUS="failed"
+          SCAN_DETAILS="Checkov scan found issues. "
+        fi
+        if [ "${{ inputs.tfsec }}" == "true" ] && [ "${{ steps.tfsec.outputs.exit_code }}" != "0" ]; then
+          SCAN_STATUS="failed"
+          SCAN_DETAILS="${SCAN_DETAILS}tfsec scan found issues. "
+        fi
+        if [ "${{ inputs.terraform-test }}" == "true" ] && [ "${{ steps.tftest.outputs.exit_code }}" != "0" ]; then
+          SCAN_STATUS="failed"
+          SCAN_DETAILS="${SCAN_DETAILS}Terraform tests failed. "
+        fi
+
+        # Build scan results JSON
+        SCAN_JSON="{}"
+        [ -f checkov_results.json ] && SCAN_JSON=$(jq -n --argjson checkov "$(cat checkov_results.json)" '{checkov: $checkov}')
+        [ -f tfsec_results.json ] && SCAN_JSON=$(echo "$SCAN_JSON" | jq --argjson tfsec "$(cat tfsec_results.json)" '. + {tfsec: $tfsec}')
+        [ -f test_output.txt ] && SCAN_JSON=$(echo "$SCAN_JSON" | jq --arg tests "$(cat test_output.txt)" '. + {tests: $tests}')
+
+        curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}/scans" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -H "Content-Type: application/json" \
+          -d "{\"scanStatus\": \"$SCAN_STATUS\", \"scanDetails\": $(echo "$SCAN_DETAILS" | jq -Rs .), \"scanResults\": $SCAN_JSON}" || true
+
+    - name: Security Scan Summary
+      id: scan-summary
+      if: inputs.command == 'plan'
+      shell: bash
+      run: |
+        if [ "${{ inputs.checkov }}" != "true" ] && [ "${{ inputs.tfsec }}" != "true" ] && [ "${{ inputs.terraform-test }}" != "true" ]; then
+          echo "scan_status=skipped" >> $GITHUB_OUTPUT
+          echo "finding_count=0" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Fetch scan results from Socle API
+        SCAN_RESPONSE=$(curl -s "${{ inputs.api-url }}/api/v1/runs/${{ inputs.run-id }}/security-scan" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" 2>/dev/null || echo '{}')
+
+        SCAN_STATUS="passed"
+        FINDING_COUNT=0
+
+        if [ "${{ inputs.checkov }}" == "true" ] && [ "${{ steps.checkov.outputs.exit_code }}" != "0" ]; then
+          SCAN_STATUS="failed"
+        fi
+        if [ "${{ inputs.tfsec }}" == "true" ] && [ "${{ steps.tfsec.outputs.exit_code }}" != "0" ]; then
+          SCAN_STATUS="failed"
+        fi
+        if [ "${{ inputs.terraform-test }}" == "true" ] && [ "${{ steps.tftest.outputs.exit_code }}" != "0" ]; then
+          SCAN_STATUS="failed"
+        fi
+
+        echo "scan_status=$SCAN_STATUS" >> $GITHUB_OUTPUT
+
+        # Write GitHub Actions job summary
+        echo "## Security Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ -f checkov_results.json ]; then
+          PASSED=$(jq -r '[.[] | .summary.passed] | add // 0' checkov_results.json 2>/dev/null || echo 0)
+          FAILED=$(jq -r '[.[] | .summary.failed] | add // 0' checkov_results.json 2>/dev/null || echo 0)
+          FINDING_COUNT=$((FINDING_COUNT + FAILED))
+          if [ "$FAILED" == "0" ]; then
+            echo "### Checkov :white_check_mark:" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Checkov :x:" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| Passed | Failed |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| $PASSED | $FAILED |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # List failed checks
+          if [ "$FAILED" != "0" ]; then
+            echo "<details><summary>Failed checks</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | .results.failed_checks[]? | "- **\(.check_id)**: \(.check_result.evaluated_keys[0] // .resource) — \(.check_id)"' checkov_results.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
+
+        if [ -f tfsec_results.json ]; then
+          TFSEC_FINDINGS=$(jq -r '[.Results[]?.Misconfigurations // [] | length] | add // 0' tfsec_results.json 2>/dev/null || echo 0)
+          FINDING_COUNT=$((FINDING_COUNT + TFSEC_FINDINGS))
+          if [ "$TFSEC_FINDINGS" == "0" ]; then
+            echo "### tfsec (Trivy) :white_check_mark:" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### tfsec (Trivy) :x:" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "$TFSEC_FINDINGS finding(s)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ -f test_output.txt ]; then
+          if [ "${{ steps.tftest.outputs.exit_code }}" == "0" ]; then
+            echo "### Terraform Test :white_check_mark:" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Terraform Test :x:" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "<details><summary>Test output</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat test_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "finding_count=$FINDING_COUNT" >> $GITHUB_OUTPUT
+
+    - name: Plan
+      if: inputs.command == 'plan'
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        set +e
+        ${{ steps.cli.outputs.bin }} plan -out=tfplan -no-color -detailed-exitcode ${{ steps.cli.outputs.destroy_flag }} 2>&1 | tee plan_output.txt
+        PLAN_EXIT=$?
+        set -e
+
+        if [ $PLAN_EXIT -eq 1 ]; then
+          echo "plan_failed=true" >> $GITHUB_OUTPUT
+          echo "error_message=$(cat plan_output.txt | tail -20)" >> $GITHUB_OUTPUT
+        else
+          ${{ steps.cli.outputs.bin }} show -json tfplan > plan.json
+          echo "plan_failed=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Apply
+      if: inputs.command == 'apply'
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        set +e
+        ${{ steps.cli.outputs.bin }} apply -auto-approve -no-color ${{ steps.cli.outputs.destroy_flag }} 2>&1 | tee apply_output.txt
+        APPLY_EXIT=$?
+        set -e
+
+        if [ $APPLY_EXIT -ne 0 ]; then
+          echo "apply_failed=true" >> $GITHUB_OUTPUT
+        else
+          echo "apply_failed=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Report Plan Result
+      if: inputs.command == 'plan'
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        if [ "${{ steps.plan.outputs.plan_failed }}" == "true" ]; then
+          curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"failed\", \"errorMessage\": $(cat plan_output.txt | jq -Rs .)}"
+        else
+          curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"planned\", \"planJson\": $(cat plan.json)}"
+        fi
+
+    - name: Report Apply Result
+      if: inputs.command == 'apply'
+      shell: bash
+      working-directory: ${{ inputs.tf-path }}
+      run: |
+        if [ "${{ steps.apply.outputs.apply_failed }}" == "true" ]; then
+          curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"failed\", \"errorMessage\": $(cat apply_output.txt | jq -Rs .)}"
+        else
+          curl -s -X POST "${{ inputs.api-url }}/callbacks/run/${{ inputs.run-id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"applied\", \"applyLog\": $(cat apply_output.txt | jq -Rs .)}"
+        fi

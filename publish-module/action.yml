@@ -1,0 +1,218 @@
+name: "Socle Publish Module"
+description: "Validate, release, and publish a Terraform module to the Socle private registry"
+author: "Socle Labs"
+
+inputs:
+  api-url:
+    description: "Socle API URL"
+    required: true
+    default: "https://api.socle.cloud"
+  api-key:
+    description: "Socle API key for authentication"
+    required: true
+  org-id:
+    description: "Socle organization ID"
+    required: true
+  catalog-entry-id:
+    description: "Socle catalog entry ID for this module"
+    required: true
+  github-token:
+    description: "GitHub token for creating releases"
+    required: true
+  tf-version:
+    description: "Terraform version to use for validation"
+    required: false
+    default: "latest"
+  tool:
+    description: "IaC tool to use for validation: terraform or opentofu"
+    required: false
+    default: "terraform"
+  working-directory:
+    description: "Path to the module source (defaults to repo root)"
+    required: false
+    default: "."
+  skip-validate:
+    description: "Skip format check and validate steps"
+    required: false
+    default: "false"
+  sync-tags:
+    description: "Sync all existing semver tags to the registry"
+    required: false
+    default: "true"
+
+outputs:
+  version:
+    description: "The published semver version (without v prefix)"
+    value: ${{ steps.version.outputs.version }}
+  download-url:
+    description: "URL of the published module archive"
+    value: ${{ steps.publish.outputs.download_url }}
+  sha256:
+    description: "SHA256 checksum of the module archive"
+    value: ${{ steps.archive.outputs.sha256 }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Extract version from tag
+      id: version
+      shell: bash
+      run: |
+        VERSION="${GITHUB_REF_NAME#v}"
+        if ! echo "$VERSION" | grep -qE '^\d+\.\d+\.\d+'; then
+          echo "::error::Tag '${GITHUB_REF_NAME}' does not match semver pattern"
+          exit 1
+        fi
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+    # --- Validation -----------------------------------------------------------
+
+    - name: Setup Terraform
+      if: inputs.skip-validate != 'true' && inputs.tool == 'terraform'
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.tf-version }}
+        terraform_wrapper: false
+
+    - name: Setup OpenTofu
+      if: inputs.skip-validate != 'true' && inputs.tool == 'opentofu'
+      uses: opentofu/setup-opentofu@v1
+      with:
+        tofu_version: ${{ inputs.tf-version }}
+        tofu_wrapper: false
+
+    - name: Set CLI binary
+      if: inputs.skip-validate != 'true'
+      id: cli
+      shell: bash
+      run: |
+        if [ "${{ inputs.tool }}" == "opentofu" ]; then
+          echo "bin=tofu" >> "$GITHUB_OUTPUT"
+        else
+          echo "bin=terraform" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Format check
+      if: inputs.skip-validate != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: ${{ steps.cli.outputs.bin }} fmt -check -recursive
+
+    - name: Validate
+      if: inputs.skip-validate != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        ${{ steps.cli.outputs.bin }} init -backend=false
+        ${{ steps.cli.outputs.bin }} validate
+
+    # --- Archive & Release ----------------------------------------------------
+
+    - name: Create source archive
+      id: archive
+      shell: bash
+      run: |
+        git archive --format=tar.gz --prefix="${GITHUB_REPOSITORY##*/}/" HEAD -o module.tar.gz
+        SHA256=$(sha256sum module.tar.gz | cut -d' ' -f1)
+        echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+    - name: Create or update GitHub release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        gh release create "${{ github.ref_name }}" module.tar.gz \
+          --title "${{ github.ref_name }}" \
+          --generate-notes \
+          || gh release upload "${{ github.ref_name }}" module.tar.gz --clobber
+
+    # --- Publish to Socle -----------------------------------------------------
+
+    - name: Publish to Socle module registry
+      id: publish
+      shell: bash
+      run: |
+        DOWNLOAD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${{ github.ref_name }}/module.tar.gz"
+        echo "download_url=${DOWNLOAD_URL}" >> "$GITHUB_OUTPUT"
+
+        HTTP_STATUS=$(curl -s -o response.json -w "%{http_code}" -X POST \
+          "${{ inputs.api-url }}/api/v1/orgs/${{ inputs.org-id }}/registry/modules" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"catalogEntryId\": \"${{ inputs.catalog-entry-id }}\",
+            \"version\": \"${{ steps.version.outputs.version }}\",
+            \"downloadUrl\": \"${DOWNLOAD_URL}\",
+            \"sha256\": \"${{ steps.archive.outputs.sha256 }}\",
+            \"githubRepo\": \"${GITHUB_REPOSITORY}\",
+            \"githubRef\": \"${{ github.ref_name }}\"
+          }")
+
+        if [ "$HTTP_STATUS" -eq 409 ]; then
+          echo "::warning::Version ${{ steps.version.outputs.version }} already exists in registry (skipped)"
+        elif [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+          echo "::error::Failed to publish to Socle registry (HTTP ${HTTP_STATUS})"
+          cat response.json
+          exit 1
+        else
+          echo "Published version ${{ steps.version.outputs.version }} to Socle registry"
+        fi
+
+        rm -f response.json
+
+    # --- Tag sync -------------------------------------------------------------
+
+    - name: Sync tags to Socle registry
+      if: inputs.sync-tags == 'true'
+      shell: bash
+      run: |
+        for tag in $(git tag -l 'v*' --sort=-v:refname); do
+          version="${tag#v}"
+
+          # Skip the version we just published
+          if [ "$version" == "${{ steps.version.outputs.version }}" ]; then
+            continue
+          fi
+
+          # Skip non-semver tags
+          if ! echo "$version" | grep -qE '^\d+\.\d+\.\d+'; then
+            continue
+          fi
+
+          # Attempt to register — 409 means already exists (fine)
+          TAG_DOWNLOAD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${tag}/module.tar.gz"
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            "${{ inputs.api-url }}/api/v1/orgs/${{ inputs.org-id }}/registry/modules" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"catalogEntryId\": \"${{ inputs.catalog-entry-id }}\",
+              \"version\": \"${version}\",
+              \"downloadUrl\": \"${TAG_DOWNLOAD_URL}\",
+              \"githubRepo\": \"${GITHUB_REPOSITORY}\",
+              \"githubRef\": \"${tag}\"
+            }")
+
+          if [ "$HTTP_STATUS" -eq 409 ]; then
+            echo "Tag ${tag} already registered (skipped)"
+          elif [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "Tag ${tag} synced to registry"
+          else
+            echo "::warning::Failed to sync tag ${tag} (HTTP ${HTTP_STATUS})"
+          fi
+        done
+
+    # --- Summary --------------------------------------------------------------
+
+    - name: Job summary
+      shell: bash
+      run: |
+        echo "## Socle Module Published" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+        echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+        echo "| **Version** | \`${{ steps.version.outputs.version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| **SHA256** | \`${{ steps.archive.outputs.sha256 }}\` |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| **Registry** | \`${{ inputs.api-url }}\` |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| **Download** | [module.tar.gz](${{ steps.publish.outputs.download_url }}) |" >> "$GITHUB_STEP_SUMMARY"
